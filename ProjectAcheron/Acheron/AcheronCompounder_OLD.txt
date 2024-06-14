@@ -1,0 +1,796 @@
+/// @title Compounder
+/// @author Built with love, by Skirk Labs ~ John Smith
+
+/// SPDX-License-Identifier: BUSL.2
+pragma solidity ^0.8.20;
+
+import "./AcheronBase.sol";
+import {IAcheronCompounder} from "./interfaces/IAcheronCompounder.sol";
+
+contract AcheronCompounder is AcheronBase, IAcheronCompounder {
+
+    using FullMath for uint256;
+    using SafeCast for uint256;
+    using SafeERC20 for IERC20;
+    using TickMath for int24;
+
+    error SumMismatch(uint256 wethValue, uint256 xSkirkAmount, uint256 total, uint256 requiredTotal);
+
+    constructor(
+        address _daiWeth,
+        address _xSkirkWeth,
+        address _xSkirk,
+        //////////////////
+        address _skirkSwapFactory,
+        address _UniFactory,
+        address _dai,
+        address _weth,
+        address _SkirkAggregator
+    ) AcheronBase(
+        _daiWeth, _xSkirkWeth, _xSkirk, _skirkSwapFactory, _UniFactory, _dai, _weth, _SkirkAggregator
+    ){}
+
+    event MangoUint256(uint256, uint256, uint160);
+    event Step(uint256);
+    event FinalAmounts(uint256, uint256, uint256 Price);
+    event SearchedAmounts(uint256, uint256);
+    event AfterSwap(uint256, uint256);
+
+    function testUppSearch(
+        uint160 sqrtPrice,
+        uint256 wethPrice,
+        uint256 xSkirkAmount
+    ) public returns(uint256 a0, uint256 a1){
+        (a0, a1,) = _upperMedianSearch(xSkirkAmount, sqrtPrice, wethPrice);
+    }
+
+    function testLowerSearch(
+        uint160 sqrtPrice,
+        uint256 wethPrice,
+        uint256 xSkirkAmount
+    ) public returns(uint256 a0, uint256 a1){
+        (a0, a1,) = _lowerMedianSearch(xSkirkAmount, sqrtPrice, wethPrice);
+    }
+
+    event StartSearch(uint256);
+    event SkirkRemaining(uint256);
+    event LiquidityAndPrice(uint256, uint128, uint160);
+    ///@notice Definitive Aggregation function to provide liquidity:
+    /// Requires amount to be more than 5e18;
+    /// To get rid of stagnated WETH, compound will call _claim then balanceOf() and said amount must be passed here.
+    /// Compound needs to call this function with say amount2Spend: 350e18(350 dollars to deposit meaning the sum is 1000.), wethAmount must always be all the weth!, xSkirk amount must only be "remaining needed amount".
+    function _aggregate_(uint256 _skirkAmount, uint256 _wethAmount, uint256 amount2Spend) internal returns(uint256, uint256, uint256){
+        // require(amount2Spend > MIN_AMOUNT, "AC: MA");
+        // CACHE:
+        uint256 skirkAmount = _skirkAmount;         // Durin compound this cuold also be more 100 dai.
+        uint256 wethAmount = _wethAmount;           // During compound this could be more 0.1(100 dai)
+        uint256 totalAmount = amount2Spend;         // This amount is the desired L to get! so 54$ would only use said amount.
+        // We get strong TWAP WETH price.
+        uint256 wethPrice = _getWethPrice();
+        // WETH/xSKIRK sqrtPrice:
+        (uint160 sqrtP_n,,,,,,) = IUniswapV3Pool(xSKIRK_WETH_POOL).slot0();
+        // Finding liquidity:
+        uint128 liquidity;
+        uint256 a0;
+        uint256 a1;
+        emit StartSearch(totalAmount);
+        if(sqrtP_n < LG){
+            uint256 wethAmount_ = _daiToWeth(wethPrice, totalAmount - ((totalAmount * 3) / 100));
+            uint128 _L = LiquidityMath.getLiquidityForAmounts(sqrtP_n, tl_SqrtP, tu_SqrtP, wethAmount_, 1e18);
+            liquidity = _L;
+        } else if(sqrtP_n >= UG){
+            uint256 wethAmount_ = _daiToWeth(wethPrice, (totalAmount / 100));   // Rest in xSkirk.
+            uint128 _L = LiquidityMath.getLiquidityForAmounts(sqrtP_n, tl_SqrtP, tu_SqrtP, wethAmount_, totalAmount - ((totalAmount * 3) / 100));
+            liquidity = _L;
+        } else {
+            if(MEDIAN_POINT < _getErInBase18(sqrtP_n, 18, 18)){
+                liquidity = _UMS(totalAmount, wethPrice, sqrtP_n);
+            }else{
+                liquidity = _LMS(totalAmount, wethPrice, sqrtP_n);
+            }
+        }
+        emit LiquidityAndPrice(wethPrice, liquidity, sqrtP_n);
+        // Handling swaps: Always ask for specific amount0Out +100, because of the division loss.
+        uint256 skirkRemaining;
+        (a0, a1, skirkRemaining) = _handlingSwap(liquidity, wethPrice, wethAmount, skirkAmount, sqrtP_n);
+        emit SkirkRemaining(skirkRemaining);
+
+        // Calculate the required total amount considering the 3% reduction
+        uint256 requiredTotal = totalAmount - ((totalAmount * 15) / 100) - 1000;
+
+        // Calculate the actual total amount
+        uint256 actualTotal = (_wethToDai(wethPrice, a0) + a1 ) + skirkRemaining;
+
+        // Use custom error if the require statement fails
+        if (actualTotal < requiredTotal) {
+            revert SumMismatch(_wethToDai(wethPrice, a0), a1, actualTotal, requiredTotal);
+        }
+
+        // Add requires to ensure sum is correct.
+        return (skirkRemaining, a0, a1);
+    }
+    /*
+    284958772113060175  Sum of 30% deposit.
+    284999999999999000
+    */  
+    event AmountsToLp(uint256, uint256);
+    event SkirkAmount(uint256);
+    event Marker(uint256);
+    function _handlingSwap(
+        uint128 liquidity,
+        uint256 wethPrice,
+        uint256 wethAmount,
+        uint256 xSkirkAmount,
+        uint160 sqrtPrice
+    ) internal returns(uint256, uint256, uint256){
+        uint256 a0;
+        uint256 a1;
+        uint256 wethRequired;
+        uint256 skirkRequired;
+        (wethRequired, skirkRequired) = LiquidityMath.getAmountsForLiquidity(sqrtPrice, tl_SqrtP, tu_SqrtP, liquidity);
+        emit AmountsToLp(wethRequired, skirkRequired);
+        wethRequired = wethRequired > 0 ? (wethRequired + 1) : 0;
+        skirkRequired = skirkRequired > 0 ? (skirkRequired + 1) : 0;  // Adding 1 wei to account for the liquidityMath rounding down division.
+
+        uint256 remaining0;
+        uint256 remaining1;
+        // Checks if the LP position only needs WETH:
+        if(skirkRequired == 0) {
+            emit Marker(1);
+            if(wethAmount >= wethRequired){             // If we have enough WETH to mint already, we do.
+                (a0, a1) = _mint(liquidity);
+                remaining0 = wethAmount - a0;
+                remaining1 = xSkirkAmount;              // Unused amount
+                if(_wethToDai(wethPrice, remaining0) > 1e16){
+                    // Swap said amount to DAI then Wrap to xSkirk.
+                    uint256 xSkirkObtained = _ensureInWeth(remaining0, wethPrice);
+                    remaining1 = remaining1 + xSkirkObtained;
+                    return (a0, a1, remaining1);
+                }  
+                return(a0, a1, remaining1);             // Unused is returned, if any.
+            } else {
+                // If we dont have enough weth for the sole weth position, we swap the skirk we SHOULD have until we get it.
+                remaining1 = _ensureOut(wethRequired - wethAmount, xSkirkAmount, wethPrice);
+                (a0, a1) = _mint(liquidity);
+                return(a0, a1, remaining1);   
+            }
+        // Check if the LP position only needs xSKIRK:
+        } else if(wethRequired == 0) {              // If we have enough xSkirk to mint already, we do.
+            emit Marker(2);
+            if(xSkirkAmount >= skirkRequired){
+                (a0, a1) = _mint(liquidity);
+                remaining0 = wethAmount;            // Unused amount.
+                remaining1 = xSkirkAmount - a1;
+                if(_wethToDai(wethPrice, remaining0) > 1e16){           // Unused weth gets swapped to xSkirk if enough present.
+                    uint256 xSkirkObtained = _ensureInWeth(remaining0, wethPrice);
+                    remaining1 = remaining1 + xSkirkObtained;
+                    return (a0, a1, remaining1);
+                }
+                return(a0, a1, remaining1);
+            } else {                                // We dont have enough xSkirk, so we swap the default weth for it.
+                uint256 xSkirkObtained = _ensureInWeth(wethAmount, wethPrice);  // We swap all our weth to xSkirk.
+                remaining1 = xSkirkAmount + xSkirkObtained;                     // Total of xSkirk we have now.
+                if(remaining1 >= skirkRequired){
+                    (a0, a1) = _mint(liquidity);
+                    return (a0, a1, remaining1 - a1);                           // No more weth here.
+                }
+                (a0, a1) = _mint(LiquidityMath.getLiquidityForAmounts(sqrtPrice, tl_SqrtP, tu_SqrtP, 0, remaining1 - 1));
+                return (a0, a1, remaining1 > a1 ? remaining1 - a1 : 0);
+            }                      
+        // Checking if we have enough WETH & enough xSkirk:                          
+        } else if(wethAmount >= wethRequired && xSkirkAmount >= skirkRequired){
+            emit Marker(3);
+            // We have enough to instantly _mint then swap the remaining WETH to DAI or xSKIRK.
+            (a0, a1) = _mint(liquidity);                // We mint
+            remaining0 = wethAmount - a0;
+            remaining1 = xSkirkAmount - a1;                 // Subtract the intial amount - what was used.
+            if(_wethToDai(wethPrice, remaining0) > 1e16){   // Weth surpluss gets swapped to xSkirk.
+                // Swap said amount to DAI then Wrap to xSkirk.
+                emit Marker(remaining0);
+                uint256 xSkirkObtained = _ensureInWeth(remaining0, wethPrice);
+                return (a0, a1, remaining1 + xSkirkObtained);
+            }                                                
+            return (a0, a1, remaining1);
+
+        // Checking if we have enough xSkirk but not enough Weth:
+        } else if(wethAmount < wethRequired && xSkirkAmount > skirkRequired){           // mint() enters here mostly:
+            emit Marker(4);
+            remaining1 = _ensureOut(wethRequired - wethAmount, xSkirkAmount, wethPrice);     // This ensures wethRequired is obtained.
+            if(remaining1 >= skirkRequired){    // If we have enough xSkirk still for the amount required we mint.
+                (a0, a1) = _mint(liquidity);    
+                return(a0, a1, remaining1 - a1);
+            }
+            // To prevent any reverts, this will re-calculate the L amount. But will only be the case on very expensive swaps.
+            (a0, a1) = _mint(LiquidityMath.getLiquidityForAmounts(sqrtPrice, tl_SqrtP, tu_SqrtP, wethRequired - 1, remaining1 - 1));
+            remaining0 = wethRequired > a0 ? wethRequired - a0 : 0;
+            remaining1 = remaining1 > a1 ? remaining1 - a1 : 0;
+            if(_wethToDai(wethPrice, remaining0) > 1e16){                       // Swaps to dai need to be accounted for the wrapping loss into xSkirk!!!
+                // Swap said amount to DAI then Wrap to xSkirk.
+                uint256 xSkirkObtained_Swap = _ensureInWeth(remaining0, wethPrice);
+                return (a0, a1, remaining1 + xSkirkObtained_Swap);
+            }  
+            return(a0, a1, remaining1);                                         // Might have weth in dust, but will get scooped in next compound.
+        // Checking if we have enough Weth but not enough xSkirk:
+        } else if(wethAmount > wethRequired && xSkirkAmount < skirkRequired){    // Can only be called by compound(). 
+            emit Marker(5);
+            // Since we already have a surpluss of weth, we swap everything to xSkirk:
+            remaining0 = wethAmount - wethRequired;
+            remaining1 = xSkirkAmount;
+            if(_wethToDai(wethPrice, remaining0) > 1e16){                       // If the surpluss is more than dust, we get it in xSkirk.
+                uint256 xSkirkObtained = _ensureInWeth(wethAmount - wethRequired, wethPrice);
+                remaining1 = remaining1 + xSkirkObtained;
+            }
+            if(remaining1 >= skirkRequired){
+                (a0, a1) = _mint(liquidity); 
+                return (a0, a1, remaining1 - a1);
+            } else {
+                // Since swapping out excess WETH does not guarantee that we will have enough to mint we get a new liquidity:
+                (a0, a1) = _mint(LiquidityMath.getLiquidityForAmounts(sqrtPrice, tl_SqrtP, tu_SqrtP, wethRequired - 1, remaining1 - 1));
+                remaining0 = wethRequired > a0 ? wethRequired - a0 : 0;
+                remaining1 = remaining1 > a1 ? remaining1 - a1 : 0;
+                
+                if(_wethToDai(wethPrice, remaining0) > 1e16){                       
+                    uint256 xSkirkObtained_Swap = _ensureInWeth(remaining0, wethPrice);
+                    return (a0, a1, (remaining1 + xSkirkObtained_Swap));
+                }  
+                return (a0, a1, remaining1); 
+            }                                                                   
+        }
+        // THrow error if we dont have enough of either. 
+        revert("Insufficient funds for liquidity provision"); 
+    }
+
+    function _UMS(
+        uint256 amount2Spend,
+        uint256 price,
+        uint160 sqrtP_n
+    ) internal pure returns(uint128){
+        // CACHE:
+        uint256 totalAmount = amount2Spend;                            // 200e18
+        uint256 target = amount2Spend - ((amount2Spend * 3) / 100);    // 194e18
+        uint256 wethPrice = price;
+        // Small value:
+        uint256 sumOnePercent = target / 100;
+        // Starting values:
+        uint256 _a0 = 1e18;         //Irrelevant since here xSKIRK is favoured.
+        uint256 _a1 = target;                                           // 194e18 on first iteration.
+        uint256 diff;
+        // Stop the loop:
+        uint8 limit;
+
+        // Starting loop:
+        while(limit != 9){
+            uint128 _L = LiquidityMath.getLiquidityForAmounts(sqrtP_n, tl_SqrtP, tu_SqrtP, _a0, _a1);
+            (uint256 a0, uint256 a1) = LiquidityMath.getAmountsForLiquidity(sqrtP_n, tl_SqrtP, tu_SqrtP, _L);
+            uint256 value = _wethToDai(wethPrice, a0);
+            uint256 sum = value + a1;
+
+            // Checking if ratios satisfy to break:
+            if(sum >= target && totalAmount > sum){
+                _a0 = a0;
+                _a1 = a1;
+                break;
+            } else if(sum > target){        // Spread exceeds budget:
+                // Check by how much this L overpays:
+                diff = sum - target;
+
+                _a0 = a0;                   // Again irrelevant
+                // Large diff: reduces xSkirk amount by half the difference.
+                // Low diff  : reduces xSkirk by exactly said difference.
+                _a1 = diff > sumOnePercent ? a1 - (diff/2) : _a1 - diff;
+
+            } else if(sum < target){        // Spread is bellow min deposit
+                // Checks by how much this L is missing target.
+                diff = target - sum;
+                _a0 = a0;                   // u know
+                _a1 = _a1 + diff;           // Here we just add the difference regardless.
+            }
+            // emit LowerM(_price, a0, a1, _a0, _a1, diff, sum);
+            limit++;
+        }
+        return(LiquidityMath.getLiquidityForAmounts(sqrtP_n, tl_SqrtP, tu_SqrtP, _a0, _a1));
+    }
+
+    function _LMS(
+        uint256 amount2Spend,
+        uint256 price,
+        uint160 sqrtP_n
+    ) internal pure returns(uint128){
+        // CACHE:
+        uint256 totalAmount = amount2Spend;
+        uint256 target = amount2Spend - ((amount2Spend * 3) / 100);
+        uint256 wethPrice = price;
+        // Small value:
+        uint256 sumFourPercent = target / 25;
+        uint256 sumOnePercent = target / 100;
+        // Starting values:
+        uint256 _a0 = _daiToWeth(wethPrice, target);       // 200 dai worth in WETH at the current "price". 
+        uint256 _a1 = totalAmount;                                      //Irrelevant since here WETH is favoured.      
+        uint256 diff;
+        // Stop the loop:
+        uint8 limit;
+        
+        while(limit != 9){
+            uint128 _L = LiquidityMath.getLiquidityForAmounts(sqrtP_n, tl_SqrtP, tu_SqrtP, _a0, _a1);
+            (uint256 a0, uint256 a1) = LiquidityMath.getAmountsForLiquidity(sqrtP_n, tl_SqrtP, tu_SqrtP, _L);
+            uint256 value = _wethToDai(wethPrice, a0);
+            uint256 sum = value + a1;
+            
+            // Checking if ratios satisfy to break:
+            if(sum >= target && totalAmount > sum){
+                _a0 = a0;
+                _a1 = a1;
+                break;
+            } else if(sum > target){        // Spread exceeds budget:
+                diff = sum - target;
+                _a1 = a1;                   // Irrelevant
+                _a0 = diff > sumFourPercent ? _a0 - (_daiToWeth(wethPrice, diff) / 2) : _a0 - _daiToWeth(wethPrice, diff);
+            } else if(sum < target){
+                diff = target - sum;
+                _a1 = _a1 + diff;           
+                _a0 = diff > sumOnePercent ? _a0 + (_daiToWeth(wethPrice, diff) / 2) : _a0 = _a0 + _daiToWeth(wethPrice, diff);
+            }
+            limit++;
+            }
+            return (LiquidityMath.getLiquidityForAmounts(sqrtP_n, tl_SqrtP, tu_SqrtP, _a0, _a1));
+    }
+
+    ///@notice Returns DAI exchangeRate for a given wethAmount.
+    function _wethToDai(uint256 _wethPrice, uint256 _wethAmount) internal pure returns (uint256 daiER) {
+        daiER = (_wethPrice * _wethAmount) / 1e18;
+    }
+
+    ///@notice Returns WETH exchangeRate for a given daiAmount.
+    function _daiToWeth(uint256 _wethPrice, uint256 _daiAmount) internal pure returns(uint256){
+        return (_daiAmount * 1e18) / _wethPrice;
+    }
+
+    ///@notice Entrypoint for xSkirkAmount to be converted into liquidity for the WETH/xSKIRK position.
+    function _aggregate(uint256 _xSkirkAmount) internal {
+        // We get strong TWAP WETH price.
+        uint256 wethPrice = _getWethPrice();
+        
+        // Checking median:
+        (uint160 sqrtP,,,,,,) = IUniswapV3Pool(xSKIRK_WETH_POOL).slot0();
+
+        // Current spot price position on curve:
+        uint8 dir = _getErInBase18(sqrtP,18,18) >= MEDIAN_POINT ? 1 : 0;
+
+        // CACHE
+        uint128 liquidity;
+        uint256 a0;             // WETH
+        uint256 a1;             // xSKIRK
+        if(dir == 1){                                       // Favours (weth/XSKIRK)
+            // Meaning most of the position will be in XSKIRK or an even spread.
+            (a0, a1, liquidity) = _upperMedianSearch(_xSkirkAmount, sqrtP, wethPrice);
+            emit SearchedAmounts(a0, a1);
+            // Swapping for said amounts:
+            (a0, a1) = _handleSwap(dir, a0, a1, wethPrice, _xSkirkAmount);
+            emit AfterSwap(a0, a1);
+            // Minting:
+            (a0, a1) = _mint(LiquidityMath.getLiquidityForAmounts(sqrtP, tl_SqrtP, tu_SqrtP, a0, a1));
+            emit FinalAmounts(a0, a1, wethPrice);
+        } else {                                            // Favours (WETH/xskirk)
+            // Meaning most of the position will be in WETH.
+            (a0, a1, liquidity) = _lowerMedianSearch(_xSkirkAmount, sqrtP, wethPrice);
+            emit SearchedAmounts(a0, a1);
+            // Swapping for said amount:
+            (a0, a1) = _handleSwap(dir, a0, a1, wethPrice, _xSkirkAmount);
+            emit AfterSwap(a0, a1);
+            (a0, a1) = _mint(LiquidityMath.getLiquidityForAmounts(sqrtP, tl_SqrtP, tu_SqrtP, a0, a1));
+            emit FinalAmounts(a0, a1, wethPrice);
+        }
+        // Check that value deposted is only off by 5% max bellow.
+        require(a1 + _calculateValue(wethPrice, a0) >= _xSkirkAmount - ((_xSkirkAmount * 5) /100), "AC: NE");
+        // Check that the value deposited is not more than max.
+        require(_xSkirkAmount >= a1 + _calculateValue(wethPrice, a0), "AC: OF");
+        emit MangoUint256(999, 999, 999);
+    }
+
+    event Target(uint256);
+    event LowerM(uint256 Price, uint256 a0, uint256 a1, uint256 _a0, uint256 _a1, uint256 diff, uint256 sum);
+    ///@notice Iteratively searches for the correct amount0, amount1 and designated liquidity to deposit 97% of xSkirkAmount.
+    ///@dev Is only invoked when the current spotPrice is equal or less than medianpoint in range.
+    function _lowerMedianSearch(uint256 _xSkirkAmount, uint160 sqrtP, uint256 _price) internal  returns(uint256, uint256, uint128){
+        // CACHE:
+        uint256 totalAmount = _xSkirkAmount;
+        uint256 target = _xSkirkAmount - ((_xSkirkAmount * 3) / 100);
+        uint256 wethPrice = _price;
+        // Starting values:
+        uint256 _a0 = _calculateAmount(_price, target + (target / 10));   
+        uint256 _a1 = totalAmount;  // //Irrelevant since here WETH is favoured.      
+        uint256 diff;
+        // Stop the loop:
+        uint8 limit;
+        emit Target(target);
+
+        while(limit != 9){
+        uint128 abstractL = LiquidityMath.getLiquidityForAmounts(sqrtP, tl_SqrtP, tu_SqrtP, _a0, _a1);
+        (uint256 a0, uint256 a1) = LiquidityMath.getAmountsForLiquidity(sqrtP, tl_SqrtP, tu_SqrtP, abstractL);
+        uint256 value = _calculateValue(_price, a0);
+        uint256 sum = value + a1;
+        
+        // Checking if ratios satisfy to break:
+        if(sum >= target && totalAmount > sum){
+            _a0 = a0;
+            _a1 = a1;
+            break;
+        } else if(sum > target){        // Spread exceeds budget:
+            diff = sum - target;
+            _a1 = a1;                   // Irrelevant
+            _a0 = diff > 4e18 ? _a0 - (_calculateAmount(wethPrice, diff) / 2) : _a0 - _calculateAmount(wethPrice, diff);
+        } else if(sum < target){
+            diff = target - sum;
+            _a1 = _a1 + diff;           
+            _a0 = diff > 1e18 ? _a0 + (_calculateAmount(wethPrice, diff) / 2) : _a0 = _a0 + _calculateAmount(wethPrice, diff);
+        }
+        emit LowerM(wethPrice, a0, a1, _a0, _a1, diff, sum);
+        limit++;
+        }
+        return (_a0, _a1, LiquidityMath.getLiquidityForAmounts(sqrtP, tl_SqrtP, tu_SqrtP, _a0, _a1));
+    }
+
+
+    ///@notice Iteratively searches for the correct amount0, amount1 and designated liquidity to deposit 97% of xSkirkAmount.
+    ///@dev Is only invoked when the current spotPrice is more than medianpoint in range.
+    function _upperMedianSearch(uint256 _xSkirkAmount, uint160 sqrtP, uint256 _price) internal  returns(uint256, uint256, uint128){
+        // CACHE:
+        uint256 totalAmount = _xSkirkAmount;
+        uint256 target = _xSkirkAmount - ((_xSkirkAmount * 3) / 100);
+        // Starting values:
+        uint256 _a0 = 1e18;         //Irrelevant since here xSKIRK is favoured.
+        uint256 _a1 = target;
+        uint256 diff;
+        // Stop the loop:
+        uint8 limit;
+
+        // Starting loop:
+        while(limit != 9){
+            uint128 abstractL = LiquidityMath.getLiquidityForAmounts(sqrtP, tl_SqrtP, tu_SqrtP, _a0, _a1);
+            (uint256 a0, uint256 a1) = LiquidityMath.getAmountsForLiquidity(sqrtP, tl_SqrtP, tu_SqrtP, abstractL);
+            uint256 value = _calculateValue(_price, a0);
+            uint256 sum = value + a1;
+
+            // Checking if ratios satisfy to break:
+            if(sum >= target && totalAmount > sum){
+                _a0 = a0;
+                _a1 = a1;
+                break;
+            } else if(sum > target){        // Spread exceeds budget:
+                // Check by how much this L overpays:
+                diff = sum - target;
+
+                _a0 = a0;                   // Again irrelevant
+                // Large diff: reduces xSkirk amount by half the difference.
+                // Low diff  : reduces xSkirk by exactly said difference.
+                _a1 = diff > 4e18 ? a1 - (diff/2) : _a1 - diff;
+
+            } else if(sum < target){        // Spread is bellow min deposit
+                // Checks by how much this L is missing target.
+                diff = target - sum;
+                _a0 = a0;                   // u know
+                _a1 = _a1 + diff;           // Here we just add the difference regardless.
+            }
+            emit LowerM(_price, a0, a1, _a0, _a1, diff, sum);
+            limit++;
+        }
+        return(_a0, _a1, LiquidityMath.getLiquidityForAmounts(sqrtP, tl_SqrtP, tu_SqrtP, _a0, _a1));
+    }
+
+    //////////////////////////////////////////////////////////////////
+    //                         Core methods:                        //
+    //////////////////////////////////////////////////////////////////
+
+    /// @notice Together with the callback, provides liquidity to a fix position.
+    /// * Assumes the contract holds enough funds for the spread at that time.
+    function _mint(uint128 liquidity) internal returns(uint256, uint256){
+        bytes memory mintCallback = abi.encode(MintCallbackData({
+            token0: WETH, token1: xSKIRK, fee: 500
+        }));
+        return IUniswapV3Pool(xSKIRK_WETH_POOL).mint(
+            address(this),
+            TL,
+            TU,
+            liquidity,
+            mintCallback
+        );
+    }
+
+    /// @notice Swaps for exact amount OUT.
+    function _exactOut(
+        SwapParams memory s
+    ) private returns (uint256 amountIn) {
+        bytes memory data = abi.encode(SwapCallbackData({
+            tokenIn: s.tokenIn,
+            tokenOut: s.tokenOut,
+            fee: s.fee
+        }));
+        bool zeroForOne = s.tokenIn < s.tokenOut;
+        (int256 amount0Delta, int256 amount1Delta) = IUniswapV3Pool(DAI_WETH_POOL).swap(
+            address(this),
+            zeroForOne,
+            -s.amount.toInt256(),
+            (zeroForOne ? TickMath.MIN_SQRT_RATIO + 1 : TickMath.MAX_SQRT_RATIO - 1),
+            data
+        );
+        uint256 amountOutReceived;
+        (amountIn, amountOutReceived) = zeroForOne
+            ? (uint256(amount0Delta), uint256(-amount1Delta))
+            : (uint256(amount1Delta), uint256(-amount0Delta));
+        require(amountOutReceived >= s.amount, "C: MI");
+    }
+
+    /// @notice Regular swap of specified amount IN.
+    function _exactIn(
+        SwapParams memory s
+    ) private returns (uint256 amountOut) {
+        bytes memory data = abi.encode(SwapCallbackData({
+            tokenIn: s.tokenIn,
+            tokenOut: s.tokenOut,
+            fee: s.fee
+        }));
+        bool zeroForOne = s.tokenIn < s.tokenOut;
+        (int256 amount0, int256 amount1) = IUniswapV3Pool(DAI_WETH_POOL).swap(
+            address(this),
+            zeroForOne,
+            s.amount.toInt256(),
+            (zeroForOne ? TickMath.MIN_SQRT_RATIO + 1 : TickMath.MAX_SQRT_RATIO - 1),
+            data
+        );
+        return uint256(-(zeroForOne ? amount1 : amount0));
+    }
+
+    event RewardsClaimed(uint256 wethAmount, uint256 xSkirkAmount);
+    ///@notice Gatheres the max amount of rewards earned by lp position.
+    function _claim() internal returns(uint256 a0, uint256 a1){
+        IUniswapV3Pool(xSKIRK_WETH_POOL).burn(TL, TU, 0);
+        (a0, a1) = IUniswapV3Pool(xSKIRK_WETH_POOL).collect(
+            address(this),
+            TL,
+            TU,
+            2**128-1,
+            2**128-1
+        );
+        emit RewardsClaimed(a0, a1);
+    }
+
+    function _getPrice(uint160 sqrtRatioX96, uint dec0, uint dec1) internal pure returns (uint256 price){
+    uint256 dec = dec1<=dec0 ? (18-dec1)+dec0 :dec0;
+    uint256 numerator1 =uint256(sqrtRatioX96) *uint256(sqrtRatioX96);  
+    uint256 numerator2 =10**dec; 
+    price = FullMath.mulDiv(numerator1, numerator2, 1 << 192);
+    }
+
+    //////////////////////////////////////////////////////////////////
+    //                         Derived Methods:                     //
+    //////////////////////////////////////////////////////////////////
+
+    event HandleSwapParams(uint8 flag, uint256 a0, uint256 a1, uint256 price, uint256 amount2Send);
+    event HandleSwapResults(uint256, uint256);
+    ///@notice Handles the swap for specific amounts. 
+    ///@dev Swap is performed on DAI/WETH uniswap pool.
+    ///@param Flag tells the position of the spot price to the contract. This helps
+    ///to either swap prioritizing WETH or xSKIRK.
+    function _handleSwap(
+        uint8 Flag,
+        uint256 amount0Required,
+        uint256 amount1Required,
+        uint256 price,
+        uint256 amount2Spend
+    ) internal returns(uint256 a0, uint256 a1){
+        emit HandleSwapParams(Flag, amount0Required, amount1Required, price, amount2Spend);
+        uint256 delta = amount2Spend - amount1Required;
+        if(Flag == 1){  // Favour xSKIRK, uses exactIn
+            (a0, a1) = _ensureIn(delta, amount2Spend, price);
+            emit HandleSwapResults(a0, a1);
+        }else{          // Favours WETH, uses exactOut
+            a0 = amount0Required;
+            (a1) = _ensureOut(amount0Required, amount2Spend, price);
+            emit HandleSwapResults(a0, a1);
+        }
+    }
+
+    ///@notice Wrapper function of _exactIn for excess WETH transfers.
+    function _ensureInWeth(uint256 amountIn, uint256 price) internal returns(uint256 xSkirkOut){
+        uint256 valueInDAI = _calculateValue(price, amountIn);
+        uint256 _daiOut = _exactIn(SwapParams({
+            tokenIn: WETH,   
+            tokenOut: DAI, 
+            fee: 500,      
+            amount: amountIn
+        }));
+        require(_daiOut >= valueInDAI - ((valueInDAI * 5)/100), "C: WU");
+        xSkirkOut = IxSkirk(xSKIRK).exactIn(IERC20(DAI).balanceOf(address(this)));
+    }
+
+    /// @notice Wrapper function of _exactIn() for slippage protection. 
+    ///@dev TokenIn is always DAI.
+    ///@return xSkirkRemaining
+    ///@return wethReceived
+    function _ensureIn(uint256 amountIn, uint256 amountToSpend, uint256 price) internal returns(uint256, uint256) {
+        require(amountIn <= amountToSpend, "AC: MEV");
+        uint256 amountReceived = _exactIn(SwapParams({
+            tokenIn: DAI,   
+            tokenOut: WETH, 
+            fee: 500,      
+            amount: amountIn
+        }));
+        uint256 valueInDAI = _calculateValue(price, amountReceived);
+        require(valueInDAI >= amountIn - ((amountIn * 3)/100), "C: FU");
+        return(amountReceived, amountToSpend - amountIn);
+    }
+
+    event MengoCheck(uint256);
+    /// @notice Wrapper function of _exactOut() for slippage protection. 
+    ///@dev TokenIn is always DAI.
+    ///@return xSkirkRemaining
+    function _ensureOut(uint256 amountOut, uint256 amountToSpend,uint256 price) internal returns(uint256) {
+            uint256 amountUsed = _exactOut(SwapParams({
+                tokenIn: DAI,
+                tokenOut: WETH,
+                fee: 500,
+                amount: amountOut
+            }));
+            uint256 valueInDAI = _calculateValue(price, amountOut);
+            emit MengoCheck(price);         // 2800                 
+            emit MengoCheck(valueInDAI);    // 123 dai in weth
+            emit MengoCheck(amountOut);     // 0.04
+            emit MengoCheck(amountUsed);    // 128 dai spent
+            require(amountUsed <= valueInDAI + (valueInDAI / 33), "C: FL"); // ~3%
+            require(amountUsed <= amountToSpend, "AC: VEM");
+            return(amountToSpend - amountUsed);
+    }
+
+
+    ///@notice Returns DAI exchangeRate for a given wethAmount.
+    function _calculateValue(uint256 _wethPrice, uint256 _wethAmount) internal pure returns (uint256 daiER) {
+        daiER = (_wethPrice * _wethAmount) / 1e18;
+    }
+
+    ///@notice Returns WETH exchangeRate for a given daiAmount.
+    function _calculateAmount(uint256 _wethPrice, uint256 _daiAmount) internal pure returns(uint256){
+        return (_daiAmount * 1e18) / _wethPrice;
+    }
+
+
+    /// @notice Calculates amounts required for provision
+    function _getAmountsForL(uint160 sqrtP, uint128 liquidity) internal pure returns(uint256 a0, uint256 a1){
+        (a0, a1) = LiquidityMath.getAmountsForLiquidity(sqrtP, TL.getSqrtRatioAtTick(), TU.getSqrtRatioAtTick(), liquidity);
+    }
+
+    /// @notice Performs the compounding for the provided totalAmount in base 18 and the USDC received in base 6.
+    function _compound(uint256 compoundingAmount, uint256 a1) private  {
+        
+    }
+
+    //////////////////////////////////////////////////////////////////
+    //                         Callbacks & modifiers:               //
+    //////////////////////////////////////////////////////////////////
+
+    function uniswapV3MintCallback(
+        uint256 amount0Owed,
+        uint256 amount1Owed,
+        bytes calldata data
+    ) external {
+        MintCallbackData memory decoded = abi.decode(data, (MintCallbackData));
+        require(msg.sender == IUniswapV3Factory(SkirkSwapFactory).getPool(decoded.token0, decoded.token1, decoded.fee), "C: WM");
+
+        if (amount0Owed > 0) IERC20(WETH).safeTransfer(msg.sender, amount0Owed);
+        if (amount1Owed > 0) IERC20(xSKIRK).safeTransfer(msg.sender, amount1Owed);
+    }
+
+    event Stuff(uint256, uint256);
+    function uniswapV3SwapCallback( /// Since this contract is only meant to swap with the wbtc/dai pool, the address can be hardcoded as the msg.sender
+        int256 amount0Delta,        /// Furthermore, the amounts requested to be swapped in DAI for the specific amountn of WBTC out, can be handeled here intead.
+        int256 amount1Delta,        /// It would be best to .burn() only the required amount after the swap went through.
+        bytes calldata _data
+    ) external {
+        require(amount0Delta > 0 || amount1Delta > 0, "C: DT");
+        SwapCallbackData memory decoded = abi.decode(_data, (SwapCallbackData));
+        require(msg.sender == IUniswapV3Factory(UniFactory).getPool(decoded.tokenIn, decoded.tokenOut, decoded.fee), "C: WM");
+
+        if (amount0Delta > 0){                      // DAI required:
+            uint256 amount = SafeCast.toUint256(amount0Delta);
+            IxSkirk(xSKIRK).burn(amount);
+            IERC20(DAI).safeTransfer(msg.sender, amount);
+        }
+        if (amount1Delta > 0){
+            IERC20(WETH).safeTransfer(msg.sender, SafeCast.toUint256(amount1Delta));
+        }
+    }
+
+
+
+
+
+
+    ////////////////////////////////////////////////////////
+    //                      DELETE                        //
+    ////////////////////////////////////////////////////////
+
+    /*          DELETE ON DEPLOYMENT.
+    * Reverts sqrtPrice q96 values to its inverted counterpart.
+    */
+    uint256 q96 = 79228162514264337593543950336;
+    function _getWethPrice() public view returns(uint256){
+        (uint160 sqrtP,,,,,,) = IUniswapV3Pool(DAI_WETH_POOL).slot0();
+        return _getErInBase18(_getInverseQ96(sqrtP, 18, 18), 18, 18);
+    }
+
+    event Flop(uint256);
+    function _getErInBase18(uint160 sqrtPrice, uint256 d0, uint256 d1) internal pure returns(uint256 price){
+        uint8 flag = d1 < d0 ? 0 : 1;
+        if(flag == 0){
+            uint256 numerator1 =uint256(sqrtPrice) *uint256(sqrtPrice);  
+            uint256 numerator2 = 1e18 * 10**(d0-d1); 
+            price = FullMath.mulDiv(numerator1, numerator2, 1 << 192);
+        } else {
+            uint256 numerator1 =uint256(sqrtPrice) *uint256(sqrtPrice);  
+            uint256 numerator2 = 1e18 / 10**(d1 -d0);                // Lowering 1e18 base by decimal difference.
+            uint256 _price = FullMath.mulDiv(numerator1, numerator2, 1 << 192);
+            price = _price;
+        }
+    } 
+                                                // 8            6  
+    function _getInverseQ96(uint160 sqrtP, uint256 d0, uint256 d1) internal view returns(uint160){
+        uint256 erInBase18 = _getErInBase18(sqrtP, d0, d1);         // RAW ER so 6400e18
+        uint256 inverse = 1e36 / erInBase18;                        // .0000156250000000000 Raw inverse ER in base 1e18
+        if(d0 == d1){
+            uint256 _q96_ = q96.mulDiv(sqrtu(inverse), sqrtu(1e18));
+            return SafeCast.toUint160(_q96_);
+        }
+        // Inversing decimals:
+        inverse = d0 > d1 ? inverse * 10**(d0 - d1) : inverse / 10**(d1 - d0);  // Shifting to match correct decimal exchange
+        uint256 _q96 = q96.mulDiv(sqrtu(inverse), sqrtu(1e18));
+        return SafeCast.toUint160(_q96);
+    }
+
+    ///@notice ALso delete on lauch!
+    function sqrtu (uint256 x) internal pure returns (uint128) {
+        unchecked {
+          if (x == 0) return 0;
+          else {
+            uint256 xx = x;
+            uint256 r = 1;
+            if (xx >= 0x100000000000000000000000000000000) { xx >>= 128; r <<= 64; }
+            if (xx >= 0x10000000000000000) { xx >>= 64; r <<= 32; }
+            if (xx >= 0x100000000) { xx >>= 32; r <<= 16; }
+            if (xx >= 0x10000) { xx >>= 16; r <<= 8; }
+            if (xx >= 0x100) { xx >>= 8; r <<= 4; }
+            if (xx >= 0x10) { xx >>= 4; r <<= 2; }
+            if (xx >= 0x8) { r <<= 1; }
+            r = (r + x / r) >> 1;
+            r = (r + x / r) >> 1;
+            r = (r + x / r) >> 1;
+            r = (r + x / r) >> 1;
+            r = (r + x / r) >> 1;
+            r = (r + x / r) >> 1;
+            r = (r + x / r) >> 1; // Seven iterations should be enough
+            uint256 r1 = x / r;
+            return uint128 (r < r1 ? r : r1);
+          }
+        }
+      }
+}
+/*
+    114680639999984027491
+    114680639999999354684
+
+    7482168357522
+    7482168357522
+
+    114680639999984027490
+    114680639999999354684
+    114680639999984027491
+    114680639999984027491
+    114680639999968700298
+*/
+
+
+/*
+    1* Create SkirkSwapFactory
+    2* AcheronCompounder will now be in xSKIRK/WETH
+    3* Burning xSKIRK to dai for swaps, must be handeled in SwapCallback.(UniswapFactory Check ONLY)
+    4* Lp deposits bellow median tick, must be handeled with exactOut in swapCallback, burning only the necesary.
+    5* Minting lp via MintCallback, must check SkirkSwapFactory!
+*/
